@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16
+    container_name: gatesense-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gatesense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gatesense_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-gatesense}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first start of an empty volume, in filename order
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/migration_add_users.sql:/docker-entrypoint-initdb.d/02-users.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/03-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gatesense} -d ${POSTGRES_DB:-gatesense}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
