@@ -1,5 +1,12 @@
 import pytest
-from plate_utils import normalize, is_valid_plate, correct_plate, candidates_from_ocr
+from plate_utils import (
+    best_candidate_from_ocr_variants,
+    normalize,
+    is_valid_plate,
+    correct_plate,
+    candidates_from_ocr,
+)
+from voting import PlateVoter
  
  
 def box(x, y, w=200, h=50):
@@ -28,6 +35,8 @@ def test_invalid(plate):
     ("TS09A81234", "TS09AB1234", 1),   # 8 read instead of B
     ("MH12DE143S", "MH12DE1435", 1),   # S read instead of 5
     ("T509AB1234", "TS09AB1234", 1),   # 5 read instead of S in the state code
+    ("TS08ABC123", "TS08ABC123", 0),   # valid three-letter series remains valid
+    ("TS07JHO122", "TS07JH0122", 1),   # ambiguous O/0 at the series-number boundary
     ("HELLO WORLD", None, None),
 ])
 def test_correct(raw, expected, fixes):
@@ -57,4 +66,34 @@ def test_candidates_pair_order_is_by_position_not_input_order():
 def test_fixes_reduce_confidence():
     found = candidates_from_ocr([(box(0, 0), "TSO9AB1234", 0.9)])
     assert found["TS09AB1234"] == pytest.approx(0.81)
- 
+
+
+def test_alternate_ocr_scales_choose_strongest_candidate_once_per_crop():
+    variants = [
+        [(box(0, 0), "TS08FQ2749", 0.58)],
+        [(box(0, 0), "TS08FQ2719", 0.61)],
+    ]
+
+    plate, confidence = best_candidate_from_ocr_variants(variants, 0.30)
+    assert plate == "TS08FQ2719"
+    assert confidence == pytest.approx(0.61)
+
+
+def test_alternate_ocr_scales_reject_candidates_below_threshold():
+    variants = [[(box(0, 0), "TS09AB1234", 0.29)]]
+
+    assert best_candidate_from_ocr_variants(variants, 0.30) is None
+
+
+def test_ocr_variants_of_one_plate_reach_the_vote_threshold():
+    voter = PlateVoter(min_votes=2)
+    observations = [("TSO7JH0122", 0.444), ("TS07JHO122", 0.464)]
+
+    for timestamp, (raw, confidence) in zip((3.0, 3.167), observations):
+        found = candidates_from_ocr([(box(0, 0), raw, confidence)])
+        assert list(found) == ["TS07JH0122"]
+        voter.add("TS07JH0122", found["TS07JH0122"], timestamp)
+
+    voted = voter.flush()
+    assert voted.plate == "TS07JH0122"
+    assert voted.votes == voted.n_reads == 2

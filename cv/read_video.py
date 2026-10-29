@@ -11,8 +11,8 @@ import cv2
 import easyocr
 from ultralytics import YOLO
 
-from plate_utils import candidates_from_ocr, is_valid_plate
-from voting import PlateVoter
+from plate_utils import best_candidate_from_ocr_variants, is_valid_plate
+from voting import PlateBoxTracker, TrackVoteManager
 
 DEFAULT_MODEL = "models/best.pt"
 ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -22,8 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="Video path or webcam index, e.g. 0")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--every", type=int, default=10,
-                        help="Process every Nth frame (default: 10)")
+    parser.add_argument("--every", type=int, default=5,
+                        help="Process every Nth frame (default: 5)")
     parser.add_argument("--det-conf", type=float, default=0.25,
                         help="Minimum YOLO detection confidence")
     parser.add_argument("--min-conf", type=float, default=0.30,
@@ -74,7 +74,8 @@ def main():
     os.makedirs(args.crops_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    voter = PlateVoter(gap=args.gap, min_votes=args.min_votes)
+    voter = TrackVoteManager(gap=args.gap, min_votes=args.min_votes)
+    box_tracker = PlateBoxTracker()
     best_frame = {}
     results = []
     frame_idx = 0
@@ -89,7 +90,8 @@ def main():
         if voted is None:
             return
 
-        best = best_frame.pop(voted.plate, None)
+        track_id = voted.track_id
+        best = best_frame.pop((track_id, voted.plate), None)
         image_path = None
 
         if best is not None:
@@ -102,6 +104,7 @@ def main():
 
         record = {
             "plate": voted.plate,
+            "track_id": track_id,
             "votes": voted.votes,
             "reads": voted.n_reads,
             "share": voted.share,
@@ -133,7 +136,8 @@ def main():
                     raise ValueError("ROI lies outside the video frame")
                 view = frame[y1:y2, x1:x2]
 
-            emit(voter.tick(timestamp))
+            for voted in voter.tick(timestamp):
+                emit(voted)
 
             if frame_idx % args.every == 0:
                 detections = detector.predict(
@@ -145,7 +149,10 @@ def main():
                 )[0]
                 ocr_frames += 1
 
-                for box in detections.boxes:
+                boxes = list(detections.boxes)
+                box_coords = [box.xyxy[0].tolist() for box in boxes]
+                track_ids = box_tracker.assign(box_coords, timestamp)
+                for box, track_id in zip(boxes, track_ids):
                     bx1, by1, bx2, by2 = (
                         int(v) for v in box.xyxy[0].tolist()
                     )
@@ -161,37 +168,48 @@ def main():
                     if crop.size == 0:
                         continue
 
-                    # Enlarge the small plate crop before OCR.
-                    enlarged = cv2.resize(
-                        crop, None, fx=2, fy=2,
-                        interpolation=cv2.INTER_CUBIC,
+                    # Pad tight detector boxes, then compare two OCR scales.
+                    pad_x = max(2, int(crop.shape[1] * 0.06))
+                    pad_y = max(2, int(crop.shape[0] * 0.12))
+                    padded = cv2.copyMakeBorder(
+                        crop, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REPLICATE,
                     )
-                    ocr_results = reader.readtext(
-                        enlarged,
-                        allowlist=ALLOWLIST,
-                        detail=1,
-                        paragraph=False,
+                    ocr_variants = []
+                    for scale in (2, 3):
+                        enlarged = cv2.resize(
+                            padded, None, fx=scale, fy=scale,
+                            interpolation=cv2.INTER_CUBIC,
+                        )
+                        ocr_variants.append(reader.readtext(
+                            enlarged,
+                            allowlist=ALLOWLIST,
+                            detail=1,
+                            paragraph=False,
+                        ))
+
+                    candidate = best_candidate_from_ocr_variants(
+                        ocr_variants, args.min_conf
                     )
-                    ocr_results = [
-                        d for d in ocr_results if float(d[2]) >= args.min_conf
-                    ]
+                    if candidate is None:
+                        continue
+                    plate, confidence = candidate
+                    if not is_valid_plate(plate):
+                        continue
 
-                    for plate, confidence in candidates_from_ocr(ocr_results).items():
-                        if not is_valid_plate(plate):
-                            continue
+                    if args.verbose:
+                        print(
+                            f"  t={timestamp:6.2f}s "
+                            f"plate={plate} OCR={confidence:.2f} "
+                            f"YOLO={float(box.conf[0]):.2f}"
+                        )
 
-                        if args.verbose:
-                            print(
-                                f"  t={timestamp:6.2f}s "
-                                f"plate={plate} OCR={confidence:.2f} "
-                                f"YOLO={float(box.conf[0]):.2f}"
-                            )
+                    crop_key = (track_id, plate)
+                    previous = best_frame.get(crop_key)
+                    if previous is None or confidence > previous[0]:
+                        best_frame[crop_key] = (confidence, crop.copy())
 
-                        previous = best_frame.get(plate)
-                        if previous is None or confidence > previous[0]:
-                            best_frame[plate] = (confidence, crop.copy())
-
-                        emit(voter.add(plate, float(confidence), timestamp))
+                    for voted in voter.add(int(track_id), plate, float(confidence), timestamp):
+                        emit(voted)
 
             if args.show:
                 preview = view.copy()
@@ -204,7 +222,8 @@ def main():
 
             frame_idx += 1
 
-        emit(voter.flush())
+        for voted in voter.flush():
+            emit(voted)
 
     finally:
         cap.release()

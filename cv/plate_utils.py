@@ -88,7 +88,9 @@ def correct_plate(text: str):
         candidate = "".join(out)
         if not is_valid_plate(candidate):
             continue
-        key = (cost, penalty)
+        # Prefer the more common plate layout when an OCR-confusable character
+        # also makes a less common layout look valid (for example, O vs 0).
+        key = (penalty, cost)
         if best is None or key < best[0]:
             best = (key, Corrected(candidate, cost))
     return best[1] if best else None
@@ -131,4 +133,14 @@ def candidates_from_ocr(detections, max_boxes: int = 6):
                             ((t1, t2) if x1 <= x2 else (t2, t1))
             consider([first, second], [c1, c2])
     return found
- 
+
+
+def best_candidate_from_ocr_variants(ocr_variants, min_conf: float):
+    """Return the strongest single plate hypothesis across OCR passes on one crop."""
+    candidates = {}
+    for detections in ocr_variants:
+        filtered = [d for d in detections if float(d[2]) >= min_conf]
+        for plate, confidence in candidates_from_ocr(filtered).items():
+            if confidence >= min_conf and confidence > candidates.get(plate, 0.0):
+                candidates[plate] = confidence
+    return max(candidates.items(), key=lambda item: item[1], default=None)

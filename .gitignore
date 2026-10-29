@@ -16,3 +16,19 @@ venv/
 cv/output/
 cv/models/*.jpg
 cv/*.mp4
+
+# Python cache and test artifacts
+*.pyo
+.coverage
+htmlcov/
+
+# Local databases and logs
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Frontend environment files
+.env.local
+.env.development.local
+.env.production.local
